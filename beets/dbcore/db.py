@@ -1,17 +1,3 @@
-# This file is part of beets.
-# Copyright 2016, Adrian Sampson.
-#
-# Permission is hereby granted, free of charge, to any person obtaining
-# a copy of this software and associated documentation files (the
-# "Software"), to deal in the Software without restriction, including
-# without limitation the rights to use, copy, modify, merge, publish,
-# distribute, sublicense, and/or sell copies of the Software, and to
-# permit persons to whom the Software is furnished to do so, subject to
-# the following conditions:
-#
-# The above copyright notice and this permission notice shall be
-# included in all copies or substantial portions of the Software.
-
 """The central Model and Database constructs for DBCore."""
 
 from __future__ import annotations
@@ -24,11 +10,12 @@ import sys
 import threading
 import time
 from abc import ABC, abstractmethod
-from collections import defaultdict
+from collections import UserDict, defaultdict
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cached_property
+from pathlib import Path
 from sqlite3 import Connection, sqlite_version_info
 from typing import (
     TYPE_CHECKING,
@@ -60,17 +47,20 @@ if TYPE_CHECKING:
         Generator,
         Iterable,
         Iterator,
+        KeysView,
         Sequence,
     )
     from sqlite3 import Connection
     from types import TracebackType
 
+    from ..util import PathLike
     from .query import FieldQueryType, Query, SQLiteType
     from .sort import FieldSort, Sort
 
 D = TypeVar("D", bound="Database", default=Any)
 
 FlexAttrs = dict[str, str]
+JSONDict = dict[str, Any]
 
 
 class DBAccessError(Exception):
@@ -86,7 +76,7 @@ class DBAccessError(Exception):
 class DBCustomFunctionError(Exception):
     """A sqlite function registered by beets failed."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__(
             "beets defined SQLite function failed; "
             "see the other errors above for details"
@@ -112,28 +102,29 @@ class FormattedMapping(Mapping[str, str]):
     """
 
     model: Model
+    model_keys: set[str]
 
     ALL_KEYS = "*"
 
     def __init__(
         self,
         model: Model,
-        included_keys: str = ALL_KEYS,
+        included_keys: str | list[str] = ALL_KEYS,
         for_path: bool = False,
-    ):
+    ) -> None:
         self.for_path = for_path
         self.model = model
-        if included_keys == self.ALL_KEYS:
+        self.model_keys = set(
             # Performance note: this triggers a database query.
-            self.model_keys = self.model.keys(True)
-        else:
-            self.model_keys = included_keys
+            self.model.keys(True)
+            if included_keys == self.ALL_KEYS
+            else included_keys
+        )
 
     def __getitem__(self, key: str) -> str:
         if key in self.model_keys:
             return self._get_formatted(self.model, key)
-        else:
-            raise KeyError(key)
+        raise KeyError(key)
 
     def __iter__(self) -> Iterator[str]:
         return iter(self.model_keys)
@@ -170,107 +161,58 @@ class FormattedMapping(Mapping[str, str]):
         return value
 
 
-# NOTE: This seems like it should be a `Mapping`, i.e.
-# ```
-# class LazyConvertDict(Mapping[str, Any])
-# ```
-# but there are some conflicts with the `Mapping` protocol such that we
-# can't do this without changing behaviour: In particular, iterators returned
-# by some methods build intermediate lists, such that modification of the
-# `LazyConvertDict` becomes safe during iteration. Some code does in fact rely
-# on this.
-class LazyConvertDict:
+class LazyDict(UserDict[str, Any]):
     """Lazily convert types for attributes fetched from the database"""
 
-    def __init__(self, model_cls: Model):
-        """Initialize the object empty"""
-        # FIXME: Dict[str, SQLiteType]
-        self._data: dict[str, Any] = {}
-        self.model_cls = model_cls
-        self._converted: dict[str, Any] = {}
+    def __init__(
+        self, data: JSONDict, convert: Callable[[str, Any], Any]
+    ) -> None:
+        super().__init__()
+        self._raw = data
+        self._convert = convert
 
-    def init(self, data: dict[str, Any]):
-        """Set the base data that should be lazily converted"""
-        self._data = data
-
-    def _convert(self, key: str, value: Any):
-        """Convert the attribute type according to the SQL type"""
-        return self.model_cls._type(key).from_sql(value)
-
-    def __setitem__(self, key: str, value: Any):
-        """Set an attribute value, assume it's already converted"""
-        self._converted[key] = value
-
-    def __getitem__(self, key: str) -> Any:
-        """Get an attribute value, converting the type on demand
-        if needed
-        """
-        if key in self._converted:
-            return self._converted[key]
-        elif key in self._data:
-            value = self._convert(key, self._data[key])
-            self._converted[key] = value
+    def __missing__(self, key: str) -> Any:
+        if key in self._raw:
+            value = self._convert(key, self._raw[key])
+            self.data[key] = value
             return value
+        return None
 
-    def __delitem__(self, key: str):
+    def __delitem__(self, key: str) -> None:
         """Delete both converted and base data"""
-        if key in self._converted:
-            del self._converted[key]
-        if key in self._data:
-            del self._data[key]
+        if key in self.data:
+            del self.data[key]
+        if key in self._raw:
+            del self._raw[key]
 
-    def keys(self) -> list[str]:
-        """Get a list of available field names for this object."""
-        return list(self._converted.keys()) + list(self._data.keys())
-
-    def copy(self) -> LazyConvertDict:
-        """Create a copy of the object."""
-        new = self.__class__(self.model_cls)
-        new._data = self._data.copy()
-        new._converted = self._converted.copy()
-        return new
-
-    # Act like a dictionary.
-
-    def update(self, values: Mapping[str, Any]):
-        """Assign all values in the given dict."""
-        for key, value in values.items():
-            self[key] = value
-
-    def items(self) -> Iterable[tuple[str, Any]]:
-        """Iterate over (key, value) pairs that this object contains.
-        Computed fields are not included.
-        """
-        for key in self:
-            yield key, self[key]
-
-    def get(self, key: str, default: Any | None = None):
-        """Get the value for a given key or `default` if it does not
-        exist.
-        """
-        if key in self:
-            return self[key]
-        else:
-            return default
-
-    def __contains__(self, key: Any) -> bool:
+    def __contains__(self, key: object) -> bool:
         """Determine whether `key` is an attribute on this object."""
-        return key in self._converted or key in self._data
+        return key in self.data or key in self._raw
 
     def __iter__(self) -> Iterator[str]:
-        """Iterate over the available field names (excluding computed
-        fields).
-        """
-        # NOTE: It would be nice to use the following:
-        # yield from self._converted
-        # yield from self._data
-        # but that won't work since some code relies on modifying `self`
-        # during iteration.
-        return iter(self.keys())
+        """Iterate over the available field names (excluding computed fields)."""
+        return iter(self._all_keys)
 
     def __len__(self) -> int:
-        # FIXME: This is incorrect due to duplication of keys
-        return len(self._converted) + len(self._data)
+        return len(self._all_keys)
+
+    @property
+    def _all_keys(self) -> set[str]:
+        return self._raw.keys() | self.data.keys()
+
+    def keys(self) -> KeysView[str]:
+        return dict.fromkeys(self._all_keys).keys()
+
+    def copy(self) -> Self:
+        new = self.__class__(self._raw.copy(), self._convert)
+        new.data = self.data.copy()
+        return new
+
+    def get(self, key: str, default: Any | None = None) -> Any:
+        """Like dict.get, but also consult raw values for lazy conversion."""
+        if key in self:
+            return self[key]
+        return default
 
 
 # Abstract base for model classes.
@@ -300,13 +242,15 @@ class Model(ABC, Generic[D]):
     flags are used to track which fields need to be stored.
     """
 
+    id: int | None
+
     # Abstract components (to be provided by subclasses).
 
-    _table: str
+    _table: ClassVar[str]
     """The main SQLite table name.
     """
 
-    _flex_table: str
+    _flex_table: ClassVar[str]
     """The flex field SQLite table name.
     """
 
@@ -315,12 +259,12 @@ class Model(ABC, Generic[D]):
     keys are field names and the values are `Type` objects.
     """
 
-    _search_fields: Sequence[str] = ()
+    _search_fields: ClassVar[Sequence[str]] = ()
     """The fields that should be queried by default by unqualified query
     terms.
     """
 
-    _indices: Sequence[Index] = ()
+    _indices: ClassVar[Sequence[Index]] = ()
     """A sequence of `Index` objects that describe the indices to be
     created for this table.
     """
@@ -354,9 +298,9 @@ class Model(ABC, Generic[D]):
     """
 
     @cached_classproperty
-    def _relation(cls):
+    def _relation(cls) -> type[Model]:
         """The model that this model is closely related to."""
-        return cls
+        return cls  # type: ignore[return-value]
 
     @cached_classproperty
     def relation_join(cls) -> str:
@@ -390,13 +334,14 @@ class Model(ABC, Generic[D]):
     def get_fresh_from_db(self) -> Self:
         """Load this object from the database."""
         model_cls = self.__class__
-        if obj := self.db._get(model_cls, self.id):
+
+        if self.id is not None and (obj := self.db._get(model_cls, self.id)):
             return obj
 
         raise NotFoundError(f"No matching {model_cls.__name__} found") from None
 
     @classmethod
-    def _getters(cls: type[Model]):
+    def _getters(cls) -> dict[str, Callable[[Self], object]]:
         """Return a mapping from field names to getter functions."""
         # We could cache this if it becomes a performance problem to
         # gather the getter mapping every time.
@@ -411,37 +356,26 @@ class Model(ABC, Generic[D]):
 
     # Basic operation.
 
-    def __init__(self, db: D | None = None, **values):
-        """Create a new object with an optional Database association and
-        initial field values.
+    def __init__(
+        self,
+        db: D | None = None,
+        fixed_values: JSONDict | None = None,
+        flex_values: JSONDict | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Create a new model instance.
+
+        `fixed_values`/`flex_values` are raw values loaded from the database and
+        converted lazily on access. `kwargs` are normal initial field values.
         """
         self._db = db
         self._dirty: set[str] = set()
-        self._values_fixed = LazyConvertDict(self)
-        self._values_flex = LazyConvertDict(self)
+        self._values_fixed = LazyDict(fixed_values or {}, self._convert)
+        self._values_flex = LazyDict(flex_values or {}, self._convert)
 
         # Initial contents.
-        self.update(values)
+        self.update(kwargs)
         self.clear_dirty()
-
-    @classmethod
-    def _awaken(
-        cls: type[AnyModel],
-        db: D | None = None,
-        fixed_values: dict[str, Any] = {},
-        flex_values: dict[str, Any] = {},
-    ) -> AnyModel:
-        """Create an object with values drawn from the database.
-
-        This is a performance optimization: the checks involved with
-        ordinary construction are bypassed.
-        """
-        obj = cls(db)
-
-        obj._values_fixed.init(fixed_values)
-        obj._values_flex.init(flex_values)
-
-        return obj
 
     def __repr__(self) -> str:
         return (
@@ -449,7 +383,7 @@ class Model(ABC, Generic[D]):
             f"({', '.join(f'{k}={v!r}' for k, v in dict(self).items())})"
         )
 
-    def clear_dirty(self):
+    def clear_dirty(self) -> None:
         """Mark all fields as *clean* (i.e., not needing to be stored to
         the database). Also update the revision.
         """
@@ -469,7 +403,7 @@ class Model(ABC, Generic[D]):
 
         return self._db
 
-    def copy(self) -> Model:
+    def copy(self) -> Self:
         """Create a copy of the model object.
 
         The field values and other state is duplicated, but the new copy
@@ -487,7 +421,7 @@ class Model(ABC, Generic[D]):
     # Essential field accessors.
 
     @classmethod
-    def _type(cls, key) -> types.Type:
+    def _type(cls, key: str) -> types.Type:
         """Get the type of a field, a `Type` instance.
 
         If the field has no explicit type, it is given the base `Type`,
@@ -510,34 +444,37 @@ class Model(ABC, Generic[D]):
                 return typ
         return types.DEFAULT
 
-    def _get(self, key, default: Any = None, raise_: bool = False):
+    @classmethod
+    def _convert(cls, key: str, value: Any) -> Any:
+        """Convert the attribute type according to the SQL type"""
+        return cls._type(key).from_sql(value)
+
+    def _get(self, key: str, default: Any = None, raise_: bool = False) -> Any:
         """Get the value for a field, or `default`. Alternatively,
         raise a KeyError if the field is not available.
         """
         getters = self._getters()
         if key in getters:  # Computed.
             return getters[key](self)
-        elif key in self._fields:  # Fixed.
+        if key in self._fields:  # Fixed.
             if key in self._values_fixed:
                 return self._values_fixed[key]
-            else:
-                return self._type(key).null
-        elif key in self._values_flex:  # Flexible.
+            return self._type(key).null
+        if key in self._values_flex:  # Flexible.
             return self._values_flex[key]
-        elif raise_:
+        if raise_:
             raise KeyError(key)
-        else:
-            return default
+        return default
 
     get = _get
 
-    def __getitem__(self, key):
+    def __getitem__(self, key: str) -> Any:
         """Get the value for a field. Raise a KeyError if the field is
         not available.
         """
         return self._get(key, raise_=True)
 
-    def _setitem(self, key, value):
+    def _setitem(self, key: str, value: Any) -> bool:
         """Assign the value for a field, return whether new and old value
         differ.
         """
@@ -559,11 +496,11 @@ class Model(ABC, Generic[D]):
 
         return changed
 
-    def __setitem__(self, key, value):
+    def __setitem__(self, key: str, value: Any) -> None:
         """Assign the value for a field."""
         self._setitem(key, value)
 
-    def __delitem__(self, key):
+    def __delitem__(self, key: str) -> None:
         """Remove a flexible attribute from the model."""
         if key in self._values_flex:  # Flexible.
             del self._values_flex[key]
@@ -575,27 +512,27 @@ class Model(ABC, Generic[D]):
         else:
             raise KeyError(f"no such field {key}")
 
-    def keys(self, computed: bool = False):
+    def keys(self, computed: bool = False) -> KeysView[str]:
         """Get a list of available field names for this object. The
         `computed` parameter controls whether computed (plugin-provided)
         fields are included in the key list.
         """
-        base_keys = list(self._fields) + list(self._values_flex.keys())
+        keys = {*self._fields, *self._values_flex}
         if computed:
-            return base_keys + list(self._getters().keys())
-        else:
-            return base_keys
+            keys.update(self._getters())
+
+        return dict.fromkeys(keys).keys()
 
     @classmethod
-    def all_keys(cls):
+    def all_keys(cls) -> KeysView[str]:
         """Get a list of available keys for objects of this type.
         Includes fixed and computed fields.
         """
-        return list(cls._fields) + list(cls._getters().keys())
+        return dict.fromkeys({*cls._fields, *cls._getters()}).keys()
 
     # Act like a dictionary.
 
-    def update(self, values):
+    def update(self, values: Mapping[str, Any]) -> None:
         """Assign all values in the given dict."""
         for key, value in values.items():
             self[key] = value
@@ -607,7 +544,7 @@ class Model(ABC, Generic[D]):
         for key in self:
             yield key, self[key]
 
-    def __contains__(self, key) -> bool:
+    def __contains__(self, key: str) -> bool:
         """Determine whether `key` is an attribute on this object."""
         return key in self.keys(computed=True)
 
@@ -619,22 +556,21 @@ class Model(ABC, Generic[D]):
 
     # Convenient attribute access.
 
-    def __getattr__(self, key):
+    def __getattr__(self, key: str) -> Any:
         if key.startswith("_"):
             raise AttributeError(f"model has no attribute {key!r}")
-        else:
-            try:
-                return self[key]
-            except KeyError:
-                raise AttributeError(f"no such field {key!r}")
+        try:
+            return self[key]
+        except KeyError:
+            raise AttributeError(f"no such field {key!r}")
 
-    def __setattr__(self, key, value):
+    def __setattr__(self, key: str, value: Any) -> None:
         if key.startswith("_"):
             super().__setattr__(key, value)
         else:
             self[key] = value
 
-    def __delattr__(self, key):
+    def __delattr__(self, key: str) -> None:
         if key.startswith("_"):
             super().__delattr__(key)
         else:
@@ -642,7 +578,7 @@ class Model(ABC, Generic[D]):
 
     # Database interaction (CRUD methods).
 
-    def store(self, fields: Iterable[str] | None = None):
+    def store(self, fields: Iterable[str] | None = None) -> None:
         """Save the object's metadata into the library database.
         :param fields: the fields to be stored. If not specified, all fields
         will be.
@@ -688,7 +624,7 @@ class Model(ABC, Generic[D]):
 
         self.clear_dirty()
 
-    def load(self):
+    def load(self) -> None:
         """Refresh the object's metadata from the library database.
 
         If check_revision is true, the database is only queried loaded when a
@@ -701,7 +637,7 @@ class Model(ABC, Generic[D]):
         self.__dict__.update(self.get_fresh_from_db().__dict__)
         self.clear_dirty()
 
-    def remove(self):
+    def remove(self) -> None:
         """Remove the object's associated rows from the database."""
         with self.db.transaction() as tx:
             tx.mutate(f"DELETE FROM {self._table} WHERE id=?", (self.id,))
@@ -733,11 +669,12 @@ class Model(ABC, Generic[D]):
             self.store()
 
     # Formatting and templating.
-
-    _formatter = FormattedMapping
+    _formatter: type[FormattedMapping]
 
     def formatted(
-        self, included_keys: str = _formatter.ALL_KEYS, for_path: bool = False
+        self,
+        included_keys: str = FormattedMapping.ALL_KEYS,
+        for_path: bool = False,
     ) -> FormattedMapping:
         """Get a mapping containing all values on this object formatted
         as human-readable unicode strings.
@@ -764,18 +701,18 @@ class Model(ABC, Generic[D]):
     # Parsing.
 
     @classmethod
-    def _parse(cls, key, string: str) -> Any:
+    def _parse(cls, key: str, string: str) -> Any:
         """Parse a string as a value for the given key."""
         if not isinstance(string, str):
             raise TypeError("_parse() argument must be a string")
 
         return cls._type(key).parse(string)
 
-    def set_parse(self, key, string: str):
+    def set_parse(self, key: str, string: str) -> None:
         """Set the object's key to a value represented by a string."""
         self[key] = self._parse(key, string)
 
-    def __getstate__(self):
+    def __getstate__(self) -> JSONDict:
         """Return the state of the object for pickling.
         Remove the database connection as sqlite connections are not
         picklable.
@@ -801,10 +738,10 @@ class Results(Generic[AnyModel]):
         model_class: type[AnyModel],
         rows: list[sqlite3.Row],
         db: D,
-        flex_rows,
+        flex_rows: list[sqlite3.Row],
         query: Query | None = None,
-        sort=None,
-    ):
+        sort: Sort | None = None,
+    ) -> None:
         """Create a result set that will construct objects of type
         `model_class`.
 
@@ -880,9 +817,8 @@ class Results(Generic[AnyModel]):
             objects = self.sort.sort(list(self._get_objects()))
             return iter(objects)
 
-        else:
-            # Objects are pre-sorted (i.e., by the database).
-            return self._get_objects()
+        # Objects are pre-sorted (i.e., by the database).
+        return self._get_objects()
 
     def _get_indexed_flex_attrs(self) -> dict[int, FlexAttrs]:
         """Index flexible attributes by the entity id they belong to"""
@@ -903,8 +839,9 @@ class Results(Generic[AnyModel]):
         values = {k: v for (k, v) in cols.items() if not k[:4] == "flex"}
 
         # Construct the Python object
-        obj = self.model_class._awaken(self.db, values, flex_values)
-        return obj
+        return self.model_class(
+            self.db, fixed_values=values, flex_values=flex_values
+        )
 
     def __len__(self) -> int:
         """Get the number of matching objects."""
@@ -912,16 +849,15 @@ class Results(Generic[AnyModel]):
             # Fully materialized. Just count the objects.
             return len(self._objects)
 
-        elif self.query:
+        if self.query:
             # A slow query. Fall back to testing every object.
             count = 0
             for obj in self:
                 count += 1
             return count
 
-        else:
-            # A fast query. Just count the rows.
-            return self._row_count
+        # A fast query. Just count the rows.
+        return self._row_count
 
     def __nonzero__(self) -> bool:
         """Does this result contain any objects?"""
@@ -931,7 +867,7 @@ class Results(Generic[AnyModel]):
         """Does this result contain any objects?"""
         return bool(len(self))
 
-    def __getitem__(self, n):
+    def __getitem__(self, n: int) -> AnyModel:
         """Get the nth item in this result set. This is inefficient: all
         items up to n are materialized and thrown away.
         """
@@ -969,7 +905,7 @@ class Transaction:
     current transaction.
     """
 
-    def __init__(self, db: Database):
+    def __init__(self, db: Database) -> None:
         self.db = db
 
     def __enter__(self) -> Transaction:
@@ -1051,21 +987,23 @@ class Transaction:
         else:
             self._mutated = True
 
-    def mutate(self, statement: str, subvals: Sequence[SQLiteType] = ()) -> Any:
+    def mutate(
+        self, statement: str, subvals: Sequence[SQLiteType] = ()
+    ) -> int | None:
         """Run one write statement with shared mutation/error handling."""
         with self._handle_mutate():
             return self.db._connection().execute(statement, subvals).lastrowid
 
     def mutate_many(
         self, statement: str, subvals: Sequence[tuple[SQLiteType, ...]] = ()
-    ) -> Any:
+    ) -> int | None:
         """Run batched writes with shared mutation/error handling."""
         with self._handle_mutate():
             return (
                 self.db._connection().executemany(statement, subvals).lastrowid
             )
 
-    def script(self, statements: str):
+    def script(self, statements: str) -> None:
         """Execute a string containing multiple SQL statements."""
         # We don't know whether this mutates, but quite likely it does.
         self._mutated = True
@@ -1096,12 +1034,24 @@ class Migration(ABC):
         finally:
             self.db._connection().row_factory = original_factory
 
-    def migrate_model(self, model_cls: type[Model], *args, **kwargs) -> None:
+    def migrate_model(
+        self, model_cls: type[Model], current_fields: set[str]
+    ) -> None:
         """Run this migration once for a model's backing table."""
         table = model_cls._table
         if not self.db.migration_exists(self.name, table):
-            self._migrate_data(model_cls, *args, **kwargs)
+            self._before_migration_backup(table)
+            self._migrate_data(model_cls, current_fields)
             self.db.record_migration(self.name, table)
+
+    def _before_migration_backup(self, table: str) -> None:
+        if not beets.config["create_backup_before_migrations"].get(bool):
+            return
+
+        dest = os.fsdecode(self.db.path) + f"-before-{table}-{self.name}.bak"
+        self.db.create_backup(dest)
+
+        print(f"Created database backup at: {dest!r}.")
 
     @abstractmethod
     def _migrate_data(
@@ -1135,7 +1085,9 @@ class Database:
     data is written in a transaction.
     """
 
-    def __init__(self, path, timeout: float = 5.0):
+    path: Path
+
+    def __init__(self, path: PathLike, timeout: float = 5.0) -> None:
         if sqlite3.threadsafety == 0:
             raise RuntimeError(
                 "sqlite3 must be compiled with multi-threading support"
@@ -1148,7 +1100,7 @@ class Database:
         if hasattr(sqlite3, "enable_callback_tracebacks"):
             sqlite3.enable_callback_tracebacks(True)
 
-        self.path = path
+        self.path = Path(os.fsdecode(path))
         self.timeout = timeout
 
         self._connections: dict[int, sqlite3.Connection] = {}
@@ -1219,10 +1171,9 @@ class Database:
         with self._shared_map_lock:
             if thread_id in self._connections:
                 return self._connections[thread_id]
-            else:
-                conn = self._create_connection()
-                self._connections[thread_id] = conn
-                return conn
+            conn = self._create_connection()
+            self._connections[thread_id] = conn
+            return conn
 
     def _create_connection(self) -> Connection:
         """Create a SQLite connection to the underlying database.
@@ -1248,8 +1199,8 @@ class Database:
             0,
         ):
             # If possible, disable double-quoted strings
-            conn.setconfig(sqlite3.SQLITE_DBCONFIG_DQS_DDL, 0)
-            conn.setconfig(sqlite3.SQLITE_DBCONFIG_DQS_DML, 0)
+            conn.setconfig(sqlite3.SQLITE_DBCONFIG_DQS_DDL, False)
+            conn.setconfig(sqlite3.SQLITE_DBCONFIG_DQS_DML, False)
 
         self.add_functions(conn)
 
@@ -1264,8 +1215,8 @@ class Database:
         conn.row_factory = sqlite3.Row
         return conn
 
-    def add_functions(self, conn):
-        def regexp(value, pattern):
+    def add_functions(self, conn: sqlite3.Connection) -> None:
+        def regexp(value: Any, pattern: str) -> bool:
             if isinstance(value, bytes):
                 value = value.decode()
             return re.search(pattern, str(value)) is not None
@@ -1294,7 +1245,7 @@ class Database:
         create_function("unidecode", 1, unidecode)
         create_function("bytelower", 1, bytelower)
 
-    def _close(self):
+    def _close(self) -> None:
         """Close the all connections to the underlying SQLite database
         from all threads. This does not render the database object
         unusable; new connections can still be opened on demand.
@@ -1325,7 +1276,7 @@ class Database:
         """
         return Transaction(self)
 
-    def load_extension(self, path: str):
+    def load_extension(self, path: str) -> None:
         """Load an SQLite extension into all open connections."""
         if not self.supports_extensions:
             raise ValueError(
@@ -1340,7 +1291,7 @@ class Database:
 
     # Schema setup and migration.
 
-    def _make_table(self, table: str, fields: Mapping[str, types.Type]):
+    def _make_table(self, table: str, fields: Mapping[str, types.Type]) -> None:
         """Set up the schema of the database. `fields` is a mapping
         from field names to `Type`s. Columns are added if necessary.
         """
@@ -1364,7 +1315,7 @@ class Database:
         with self.transaction() as tx:
             tx.script(setup_sql)
 
-    def _make_attribute_table(self, flex_table: str):
+    def _make_attribute_table(self, flex_table: str) -> None:
         """Create a table and associated index for flexible attributes
         for the given entity (if they don't exist).
         """
@@ -1380,7 +1331,7 @@ class Database:
                     ON {flex_table} (entity_id);
                 """)
 
-    def _create_indices(self, table: str, indices: Sequence[Index]):
+    def _create_indices(self, table: str, indices: Sequence[Index]) -> None:
         """Create indices for the given table if they don't exist."""
         with self.transaction() as tx:
             for index in indices:
@@ -1410,6 +1361,15 @@ class Database:
                     model_cls, self.db_tables[model_cls._table]["columns"]
                 )
 
+    def create_backup(self, dest: str) -> None:
+        """Create a backup of the database at `dest`."""
+        # Use the SQLite backup API so the copy is consistent even when the
+        # database is open and may have a journal/WAL.
+        dest_conn = sqlite3.connect(dest)
+        with self.transaction():
+            self._connection().backup(dest_conn)
+        dest_conn.close()
+
     def migration_exists(self, name: str, table: str) -> bool:
         """Return whether a named migration has been marked complete."""
         return name in self.db_tables[table]["migrations"]
@@ -1424,7 +1384,7 @@ class Database:
 
     # Querying.
 
-    def _fetch(
+    def _get_results(
         self,
         model_cls: type[AnyModel],
         query: Query | None = None,
@@ -1484,7 +1444,7 @@ class Database:
 
     def _get(self, model_cls: type[AnyModel], id_: int) -> AnyModel | None:
         """Get a Model object by its id or None if the id does not exist."""
-        return self._fetch(model_cls, MatchQuery("id", id_)).get()
+        return self._get_results(model_cls, MatchQuery("id", id_)).get()
 
 
 class Index(NamedTuple):
